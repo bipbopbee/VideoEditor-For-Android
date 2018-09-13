@@ -30,10 +30,14 @@ import android.os.Message;
 import android.util.Log;
 import android.view.Surface;
 
+import com.example.cj.videoeditor.rtmp.RtmpPusher;
+
 import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
-
+import java.util.Arrays;
+import java.util.concurrent.LinkedBlockingQueue;
+import com.example.cj.videoeditor.rtmp.Config;
 /**
  * This class wraps up the core components used for surface-input video encoding.
  * <p>
@@ -53,6 +57,22 @@ public class VideoEncoderCore {
     private static final int FRAME_RATE = 30;               // 30fps
     private static final int IFRAME_INTERVAL = 1;           // 1 seconds between I-frames
 
+    public static final int NAL_SLICE = 1;
+    public static final int NAL_SLICE_DPA = 2;
+    public static final int NAL_SLICE_DPB = 3;
+    public static final int NAL_SLICE_DPC = 4;
+    public static final int NAL_SLICE_IDR = 5;
+    public static final int NAL_SEI = 6;
+    public static final int NAL_SPS = 7;
+    public static final int NAL_PPS = 8;
+    public static final int NAL_AUD = 9;
+    public static final int NAL_FILLER = 12;
+    private LinkedBlockingQueue<Runnable> mRunnables = new LinkedBlockingQueue<>();
+    private Config mConfig;
+    private Thread workThread;
+    private boolean loop;
+    private RtmpPusher mRtmpPublisher;
+    public boolean isPublish;
     //音频配置
     private String audioMime = "audio/mp4a-latm";   //音频编码的Mime
     private AudioRecord mRecorder;   //录音器
@@ -131,6 +151,23 @@ public class VideoEncoderCore {
         audioRecorder = new AudioEncoder();
         audioThread = new Thread(audioRecorder);
         audioThread.start();
+        mRtmpPublisher = RtmpPusher.newInstance();
+        workThread = new Thread("publish-thread") {
+            @Override
+            public void run() {
+                while (loop && !Thread.interrupted()) {
+                    try {
+                        Runnable runnable = mRunnables.take();
+                        runnable.run();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        };
+
+        loop = true;
+        workThread.start();
     }
 
     /**
@@ -243,6 +280,7 @@ public class VideoEncoderCore {
                     // adjust the ByteBuffer values to match BufferInfo (not needed?)
 //                    encodedData.position(mBufferInfo.offset);
 //                    encodedData.limit(mBufferInfo.offset + mBufferInfo.size);
+                    onEncodedAvcFrame(encodedData, mBufferInfo);
                     if (mMuxerStarted) {
                         mMuxer.writeSampleData(mVideoTrackIndex, encodedData, mBufferInfo);
                         if (VERBOSE) {
@@ -411,6 +449,7 @@ public class VideoEncoderCore {
                     buffer.position(mInfo.offset);
                     if (mMuxerStarted && mInfo.presentationTimeUs > 0) {
                         try {
+                            onEncodeAacFrame(buffer, mInfo);
                             mMuxer.writeSampleData(mAudioTrackIndex, buffer, mInfo);
                         } catch (Exception e) {
                             e.printStackTrace();
@@ -503,6 +542,7 @@ public class VideoEncoderCore {
 
     public void startRecord() {
         audioRecorder.startRecord();
+        starPublish();
     }
 
     public void pauseRecording() {
@@ -512,4 +552,138 @@ public class VideoEncoderCore {
     public void resumeRecording() {
         audioRecorder.resume();
     }
+    private void onEncodedAvcFrame(ByteBuffer bb, final MediaCodec.BufferInfo vBufferInfo) {
+        int offset = 4;
+        //判断帧的类型
+        if (bb.get(2) == 0x01) {
+            offset = 3;
+        }
+        int type = bb.get(offset) & 0x1f;
+        Log.d(TAG, "type=" + type);
+        if (type == NAL_SPS) {
+            //[0, 0, 0, 1, 103, 66, -64, 13, -38, 5, -126, 90, 1, -31, 16, -115, 64, 0, 0, 0, 1, 104, -50, 6, -30]
+            //打印发现这里将 SPS帧和 PPS帧合在了一起发送
+            // SPS为 [4，len-8]
+            // PPS为后4个字节
+            final byte[] pps = new byte[4];
+            final byte[] sps = new byte[vBufferInfo.size - 12];
+            bb.getInt();// 抛弃 0,0,0,1
+            bb.get(sps, 0, sps.length);
+            bb.getInt();
+            bb.get(pps, 0, pps.length);
+            Log.d(TAG, "解析得到 sps:" + Arrays.toString(sps) + ",PPS=" + Arrays.toString(pps));
+            Runnable runnable = new Runnable() {
+                @Override
+                public void run() {
+                    mRtmpPublisher.sendSpsAndPps(sps, sps.length, pps, pps.length,
+                            vBufferInfo.presentationTimeUs / 1000);
+                }
+            };
+            try {
+                mRunnables.put(runnable);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
+        } else if (type == NAL_SLICE || type == NAL_SLICE_IDR) {
+            final byte[] bytes = new byte[vBufferInfo.size];
+            bb.get(bytes);
+            Runnable runnable = new Runnable() {
+                @Override
+                public void run() {
+                    mRtmpPublisher.sendVideoData(bytes, bytes.length,
+                            vBufferInfo.presentationTimeUs / 1000);
+                }
+            };
+            try {
+                mRunnables.put(runnable);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
+        }
+
+    }
+
+    private void onEncodeAacFrame(ByteBuffer bb, final MediaCodec.BufferInfo aBufferInfo) {
+
+
+        if (aBufferInfo.size == 2) {
+            // 我打印发现，这里应该已经是吧关键帧计算好了，所以我们直接发送
+            final byte[] bytes = new byte[2];
+            bb.get(bytes);
+            Runnable runnable = new Runnable() {
+                @Override
+                public void run() {
+                    mRtmpPublisher.sendAacSpec(bytes, 2);
+                }
+            };
+            try {
+                mRunnables.put(runnable);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
+        } else {
+            final byte[] bytes = new byte[aBufferInfo.size];
+            bb.get(bytes);
+
+            Runnable runnable = new Runnable() {
+                @Override
+                public void run() {
+                    mRtmpPublisher.sendAacData(bytes, bytes.length, aBufferInfo.presentationTimeUs / 1000);
+                }
+            };
+            try {
+                mRunnables.put(runnable);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
+        }
+
+    }
+    /**
+     * 发布
+     */
+    public void starPublish() {
+        if (isPublish) {
+            return;
+        }
+
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+                //初始化
+                int ret = mRtmpPublisher.init(mConfig.publishUrl,
+                        videoParams.previewWidth,
+                        videoParams.previewHeight, mConfig.timeOut);
+                if (ret < 0) {
+                    Log.e(TAG, "连接失败");
+                    return;
+                }
+
+                isPublish = true;
+            }
+        };
+        mRunnables.add(runnable);
+    }
+
+
+    /**
+     * 停止发布
+     */
+    public void stopPublish() {
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+                mRtmpPublisher.stop();
+                loop = false;
+                workThread.interrupt();
+            }
+        };
+
+        mRunnables.add(runnable);
+    }
+
 }
