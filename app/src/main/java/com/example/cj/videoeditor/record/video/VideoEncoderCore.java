@@ -30,6 +30,7 @@ import android.os.Message;
 import android.util.Log;
 import android.view.Surface;
 
+import com.example.cj.videoeditor.rtmp.Config;
 import com.example.cj.videoeditor.rtmp.RtmpPusher;
 
 import java.io.IOException;
@@ -37,7 +38,6 @@ import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.concurrent.LinkedBlockingQueue;
-import com.example.cj.videoeditor.rtmp.Config;
 /**
  * This class wraps up the core components used for surface-input video encoding.
  * <p>
@@ -73,6 +73,7 @@ public class VideoEncoderCore {
     private boolean loop;
     private RtmpPusher mRtmpPublisher;
     public boolean isPublish;
+    Params videoParams;
     //音频配置
     private String audioMime = "audio/mp4a-latm";   //音频编码的Mime
     private AudioRecord mRecorder;   //录音器
@@ -166,8 +167,12 @@ public class VideoEncoderCore {
             }
         };
 
+        mConfig = new Config.Builder().setUrl( "rtmp://11848.livepush.myqcloud.com/live/" +
+                "11848_0b3bf9f55e?bizid=11848&txSecret=c415aa0e5d84948bbd26fac10901ce1e&txTime=5B9D2C7F").build();
+        videoParams = new Params(width, height);
         loop = true;
         workThread.start();
+        starPublish();
     }
 
     /**
@@ -542,7 +547,6 @@ public class VideoEncoderCore {
 
     public void startRecord() {
         audioRecorder.startRecord();
-        starPublish();
     }
 
     public void pauseRecording() {
@@ -684,6 +688,15 @@ public class VideoEncoderCore {
         };
 
         mRunnables.add(runnable);
+    }
+    public static class Params {
+        public  int previewWidth;
+        public  int previewHeight;
+
+        public Params(int width, int height) {
+            this.previewWidth = width;
+            this.previewHeight = height;
+        }
     }
 
 }
